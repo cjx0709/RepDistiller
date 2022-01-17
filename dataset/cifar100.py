@@ -28,7 +28,7 @@ def get_data_folder():
     elif hostname.startswith('yonglong-home'):
         data_folder = '/home/yonglong/Data/data'
     else:
-        data_folder = './data/'
+        data_folder = '/workspace/volume/zxy-mm/data'
 
     if not os.path.isdir(data_folder):
         os.makedirs(data_folder)
@@ -41,7 +41,8 @@ class CIFAR100Instance(datasets.CIFAR100):
     """
     def __getitem__(self, index):
         if self.train:
-            img, target = self.train_data[index], self.train_labels[index]
+            #img, target = self.data[index], self.targets[index]
+            img, target = self.data[index], self.targets[index]
         else:
             img, target = self.test_data[index], self.test_labels[index]
 
@@ -121,8 +122,8 @@ class CIFAR100InstanceSample(datasets.CIFAR100):
 
         num_classes = 100
         if self.train:
-            num_samples = len(self.train_data)
-            label = self.train_labels
+            num_samples = len(self.data)
+            label = self.targets
         else:
             num_samples = len(self.test_data)
             label = self.test_labels
@@ -151,7 +152,7 @@ class CIFAR100InstanceSample(datasets.CIFAR100):
 
     def __getitem__(self, index):
         if self.train:
-            img, target = self.train_data[index], self.train_labels[index]
+            img, target = self.data[index], self.targets[index]
         else:
             img, target = self.test_data[index], self.test_labels[index]
 

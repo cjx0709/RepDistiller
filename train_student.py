@@ -87,6 +87,14 @@ def parse_option():
     # hint layer
     parser.add_argument('--hint_layer', default=2, type=int, choices=[0, 1, 2, 3, 4])
 
+    # AGB
+    parser.add_argument('--train_kind', default=1, type=int, choices=[0, 1],
+                        help='0 for manul tuning, 1 for AGB')
+    parser.add_argument('--warm_up', default=1, choices=[0,1], type=int, 
+                        help='0 for set angle manually, 1 for use the warm-up search')
+    parser.add_argument('--angle', default=0.3, type=float, help='angle bettwen two gradients')
+    parser.add_argument('--w_epoch', default=5, type=int, help='warm up epochs to find the best factor')
+    
     opt = parser.parse_args()
 
     # set different learning rate from these 4 models
@@ -107,9 +115,14 @@ def parse_option():
         opt.lr_decay_epochs.append(int(it))
 
     opt.model_t = get_teacher_name(opt.path_t)
-
-    opt.model_name = 'S:{}_T:{}_{}_{}_r:{}_a:{}_b:{}_{}'.format(opt.model_s, opt.model_t, opt.dataset, opt.distill,
-                                                                opt.gamma, opt.alpha, opt.beta, opt.trial)
+    if opt.train_kind == 0:
+        opt.model_name = 'S:{}_T:{}_{}_{}_r:{}_a:{}_b:{}_{}'.format(opt.model_s, opt.model_t, opt.dataset, opt.distill,
+                                                                    opt.gamma, opt.alpha, opt.beta, opt.trial)
+    elif opt.warm_up == 0:
+        opt.model_name = 'S:{}_T:{}_{}_{}_angle:{}'.format(opt.model_s, opt.model_t, opt.dataset, opt.distill,
+                                                           opt.angle)
+    else:
+        opt.model_name = "S:{}_T:{}_{}_{}_AGB".format(opt.model_s, opt.model_t, opt.dataset, opt.distill)
 
     opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
     if not os.path.isdir(opt.tb_folder):
@@ -139,12 +152,191 @@ def load_teacher(model_path, n_cls):
     print('==> done')
     return model
 
+def warm_up(angle, opt):
+    opt.angle = angle
+    best_acc = 0
+    # tensorboard logger
+    logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
+
+    # dataloader
+    if opt.dataset == 'cifar100':
+        if opt.distill in ['crd']:
+            train_loader, val_loader, n_data = get_cifar100_dataloaders_sample(batch_size=opt.batch_size,
+                                                                               num_workers=opt.num_workers,
+                                                                               k=opt.nce_k,
+                                                                               mode=opt.mode)
+        else:
+            train_loader, val_loader, n_data = get_cifar100_dataloaders(batch_size=opt.batch_size,
+                                                                        num_workers=opt.num_workers,
+                                                                        is_instance=True)
+        n_cls = 100
+    else:
+        raise NotImplementedError(opt.dataset)
+
+    # model
+    model_t = load_teacher(opt.path_t, n_cls)
+    model_s = model_dict[opt.model_s](num_classes=n_cls)
+
+    data = torch.randn(2, 3, 32, 32)
+    model_t.eval()
+    model_s.eval()
+    feat_t, _ = model_t(data, is_feat=True)
+    feat_s, _ = model_s(data, is_feat=True)
+
+    module_list = nn.ModuleList([])
+    module_list.append(model_s)
+    trainable_list = nn.ModuleList([])
+    trainable_list.append(model_s)
+
+    criterion_cls = nn.CrossEntropyLoss()
+    criterion_div = DistillKL(opt.kd_T)
+    if opt.distill == 'kd':
+        criterion_kd = DistillKL(opt.kd_T)
+    elif opt.distill == 'hint':
+        criterion_kd = HintLoss()
+        regress_s = ConvReg(feat_s[opt.hint_layer].shape, feat_t[opt.hint_layer].shape)
+        module_list.append(regress_s)
+        trainable_list.append(regress_s)
+    elif opt.distill == 'crd':
+        opt.s_dim = feat_s[-1].shape[1]
+        opt.t_dim = feat_t[-1].shape[1]
+        opt.n_data = n_data
+        criterion_kd = CRDLoss(opt)
+        module_list.append(criterion_kd.embed_s)
+        module_list.append(criterion_kd.embed_t)
+        trainable_list.append(criterion_kd.embed_s)
+        trainable_list.append(criterion_kd.embed_t)
+    elif opt.distill == 'attention':
+        criterion_kd = Attention()
+    elif opt.distill == 'nst':
+        criterion_kd = NSTLoss()
+    elif opt.distill == 'similarity':
+        criterion_kd = Similarity()
+    elif opt.distill == 'rkd':
+        criterion_kd = RKDLoss()
+    elif opt.distill == 'pkt':
+        criterion_kd = PKT()
+    elif opt.distill == 'kdsvd':
+        criterion_kd = KDSVD()
+    elif opt.distill == 'correlation':
+        criterion_kd = Correlation()
+        embed_s = LinearEmbed(feat_s[-1].shape[1], opt.feat_dim)
+        embed_t = LinearEmbed(feat_t[-1].shape[1], opt.feat_dim)
+        module_list.append(embed_s)
+        module_list.append(embed_t)
+        trainable_list.append(embed_s)
+        trainable_list.append(embed_t)
+    elif opt.distill == 'vid':
+        s_n = [f.shape[1] for f in feat_s[1:-1]]
+        t_n = [f.shape[1] for f in feat_t[1:-1]]
+        criterion_kd = nn.ModuleList(
+            [VIDLoss(s, t, t) for s, t in zip(s_n, t_n)]
+        )
+        # add this as some parameters in VIDLoss need to be updated
+        trainable_list.append(criterion_kd)
+    elif opt.distill == 'abound':
+        s_shapes = [f.shape for f in feat_s[1:-1]]
+        t_shapes = [f.shape for f in feat_t[1:-1]]
+        connector = Connector(s_shapes, t_shapes)
+        # init stage training
+        init_trainable_list = nn.ModuleList([])
+        init_trainable_list.append(connector)
+        init_trainable_list.append(model_s.get_feat_modules())
+        criterion_kd = ABLoss(len(feat_s[1:-1]))
+        init(model_s, model_t, init_trainable_list, criterion_kd, train_loader, logger, opt)
+        # classification
+        module_list.append(connector)
+    elif opt.distill == 'factor':
+        s_shape = feat_s[-2].shape
+        t_shape = feat_t[-2].shape
+        paraphraser = Paraphraser(t_shape)
+        translator = Translator(s_shape, t_shape)
+        # init stage training
+        init_trainable_list = nn.ModuleList([])
+        init_trainable_list.append(paraphraser)
+        criterion_init = nn.MSELoss()
+        init(model_s, model_t, init_trainable_list, criterion_init, train_loader, logger, opt)
+        # classification
+        criterion_kd = FactorTransfer()
+        module_list.append(translator)
+        module_list.append(paraphraser)
+        trainable_list.append(translator)
+    elif opt.distill == 'fsp':
+        s_shapes = [s.shape for s in feat_s[:-1]]
+        t_shapes = [t.shape for t in feat_t[:-1]]
+        criterion_kd = FSP(s_shapes, t_shapes)
+        # init stage training
+        init_trainable_list = nn.ModuleList([])
+        init_trainable_list.append(model_s.get_feat_modules())
+        init(model_s, model_t, init_trainable_list, criterion_kd, train_loader, logger, opt)
+        # classification training
+        pass
+    else:
+        raise NotImplementedError(opt.distill)
+
+    criterion_list = nn.ModuleList([])
+    criterion_list.append(criterion_cls)    # classification loss
+    criterion_list.append(criterion_div)    # KL divergence loss, original knowledge distillation
+    criterion_list.append(criterion_kd)     # other knowledge distillation loss
+
+    # optimizer
+    optimizer = optim.SGD(trainable_list.parameters(),
+                          lr=opt.learning_rate,
+                          momentum=opt.momentum,
+                          weight_decay=opt.weight_decay)
+
+    # append teacher after optimizer to avoid weight_decay
+    module_list.append(model_t)
+
+    if torch.cuda.is_available():
+        module_list.cuda()
+        criterion_list.cuda()
+        cudnn.benchmark = True
+
+    # validate teacher accuracy
+    teacher_acc, _, _ = validate(val_loader, model_t, criterion_cls, opt)
+    print('teacher accuracy: ', teacher_acc)
+
+    # routine
+    for epoch in range(1, opt.w_epoch + 1):
+        adjust_learning_rate(epoch, opt, optimizer)
+        print("==> training...")
+
+        time1 = time.time()
+        train_acc, train_loss = train(epoch, train_loader, module_list, criterion_list, optimizer, opt)
+        time2 = time.time()
+        print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
+
+        test_acc, tect_acc_top5, test_loss = validate(val_loader, model_s, criterion_cls, opt)
+
+        # save the best model
+        if test_acc > best_acc:
+            best_acc = test_acc
+
+    return best_acc
+
 
 def main():
     best_acc = 0
 
     opt = parse_option()
 
+    #warm_up
+    if opt.train_kind == 1:
+        if opt.warm_up == 1:
+            print("==> warm up")
+            if opt.distill == 'nst':
+                angles = [0.05, 0.1, 0.2, 0.4, 0.8]
+            else:
+                angles = [0.1, 0.3, 0.5, 0.7, 0.9]
+            for angle in angles:
+                acc = warm_up(angle, opt)
+                if acc > best_acc:
+                    best_acc = acc
+                    best_angle = angle
+            opt.angle = best_angle
+
+    best_acc = 0       
     # tensorboard logger
     logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
 

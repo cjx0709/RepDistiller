@@ -3,6 +3,7 @@ from __future__ import print_function, division
 import sys
 import time
 import torch
+#import numpy as np 
 
 from .util import AverageMeter, accuracy
 
@@ -64,6 +65,27 @@ def train_vanilla(epoch, train_loader, model, criterion, optimizer, opt):
 
     return top1.avg, losses.avg
 
+def catch_grad(loss, model, optim):
+    optim.zero_grad()
+    loss.backward(retain_graph=True)
+    out = list()
+    for param in model.parameters():
+        out.append(param.grad.clone().reshape(-1))
+    return torch.cat(out)
+
+def compute_scale(loss_m, loss_s, angle):
+    m_m = torch.norm(loss_m)
+    s_m = torch.norm(loss_s)
+
+    # angle trans to factor
+    cita = torch.arccos(loss_m.dot(loss_s)/m_m/s_m) 
+    factor = - torch.cos(cita) + torch.sqrt(torch.cos(cita)**2 + (torch.cos(angle*cita)**2 - torch.cos(cita)**2)/(torch.sin(angle*cita)**2))   
+
+    beta = m_m/s_m/factor
+    loss_r = loss_m + loss_s * beta
+    r_m = torch.norm(loss_r)
+    s = r_m / m_m
+    return 1/s, beta/s
 
 def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, opt):
     """One epoch distillation"""
@@ -181,8 +203,21 @@ def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, o
         else:
             raise NotImplementedError(opt.distill)
 
-        loss = opt.gamma * loss_cls + opt.alpha * loss_div + opt.beta * loss_kd
+        if opt.train_kind == 0:
+            loss = opt.gamma * loss_cls + opt.alpha * loss_div + opt.beta * loss_kd
+        else:
+            if opt.distill =='kd':
+                grad_m = catch_grad(loss_cls, model_s, optimizer)
+                grad_s = catch_grad(loss_div, model_s, optimizer)
+            else:
+                grad_m = catch_grad(loss_cls, model_s, optimizer)
+                grad_s = catch_grad(loss_kd, model_s, optimizer)
 
+            alpha, beta = compute_scale(grad_m, grad_s, opt.angle)
+            if opt.distill == 'kd':            
+                loss = alpha * loss_cls + beta * loss_div
+            else:
+                loss = alpha * loss_cls + beta * loss_kd
         acc1, acc5 = accuracy(logit_s, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
         top1.update(acc1[0], input.size(0))
