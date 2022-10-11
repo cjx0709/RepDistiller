@@ -25,12 +25,12 @@ This repo was tested with Ubuntu 16.04.1 LTS, Python3.6.10, PyTorch 1.8.1, and C
 
     or for AGB with angle train:
     ```
-    python train_student.py --path_t ./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth --distill kd --model_s resnet8x4 --train_kind 0 --warm_up 0 --angle 0.3
+    python train_student.py --path_t ./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth --distill kd --model_s resnet8x4 --train_kind 1 --warm_up 0 --angle 0.3
     ``` 
     
 
     or for AGB method without any weights:
     ```
-    python train_student.py --path_t ./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth --distill kd --model_s resnet8x4 --train_kind 0 --warm_up 1
+    python train_student.py --path_t ./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth --distill kd --model_s resnet8x4 --train_kind 1 --warm_up 1
     ```
     
